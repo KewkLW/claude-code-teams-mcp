@@ -109,6 +109,23 @@ def build_spawn_command(
     return cmd
 
 
+def build_codex_spawn_command(
+    member: TeammateMember,
+    codex_home: str | None = None,
+) -> str:
+    """Build shell command to spawn a Codex teammate in tmux."""
+    team_name = member.agent_id.split("@", 1)[1]
+    env_prefix = ""
+    if codex_home:
+        env_prefix = f"CODEX_HOME={shlex.quote(codex_home)} "
+    cmd = (
+        f"cd {shlex.quote(member.cwd)} && "
+        f"{env_prefix}"
+        f"codex --full-auto"
+    )
+    return cmd
+
+
 def build_opencode_attach_command(
     opencode_binary: str,
     server_url: str,
@@ -162,6 +179,11 @@ def spawn_teammate(
         raise ValueError(
             "Cannot spawn claude teammate: 'claude' binary not found on PATH. "
             "Install Claude Code or ensure it is in your PATH."
+        )
+    if backend_type == "codex" and not shutil.which("codex"):
+        raise ValueError(
+            "Cannot spawn codex teammate: 'codex' binary not found on PATH. "
+            "Install Codex CLI or ensure it is in your PATH."
         )
 
     resolved_cwd = cwd or str(Path.cwd())
@@ -226,6 +248,9 @@ def spawn_teammate(
                 opencode_session_id,
                 resolved_cwd,
             )
+        elif backend_type == "codex":
+            codex_home = os.environ.get("CODEX_HOME")
+            cmd = build_codex_spawn_command(member, codex_home)
         else:
             cmd = build_spawn_command(member, claude_binary, lead_session_id)
 

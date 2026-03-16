@@ -37,6 +37,8 @@ KNOWN_CLIENTS: dict[str, str] = {
     "claude-code": "claude",
     "claude": "claude",
     "opencode": "opencode",
+    "codex": "codex",
+    "codex-cli": "codex",
 }
 
 # NOTE(victor): Mutated by both app_lifespan and HarnessDetectionMiddleware.
@@ -420,7 +422,7 @@ def spawn_teammate_tool(
     model: str = "sonnet",
     subagent_type: str = "general-purpose",
     plan_mode_required: bool = False,
-    backend_type: Literal["claude", "opencode"] = "claude",
+    backend_type: Literal["claude", "opencode", "codex"] = "claude",
 ) -> dict:
     """Spawn a new teammate in tmux. Description is dynamically updated
     at startup with available backends and models."""
@@ -1020,6 +1022,112 @@ async def check_teammate(
     if include_output:
         result["output"] = output
     return result
+
+
+# ── Task Distribution Tools ────────────────────────────────────────────
+
+from claude_teams import distributor
+
+
+@mcp.tool
+def distribute(team_name: str) -> list[dict]:
+    """Run the task distributor. Assigns all ready (unblocked, unclaimed) tasks
+    to the best-fit available agent based on capability matching, load balancing,
+    and priority scoring. Returns list of assignments made."""
+    try:
+        assignments = distributor.distribute_tasks(team_name)
+    except ValueError as e:
+        raise ToolError(str(e))
+    if not assignments:
+        return [{"message": "No tasks to distribute (none ready or no capable agents available)"}]
+    return assignments
+
+
+@mcp.tool
+def suggest_subtasks(description: str) -> list[dict]:
+    """Suggest how to decompose a high-level task description into subtasks
+    with task_type and priority annotations. The team lead should review and
+    refine these before creating them. Returns list of suggested subtask dicts
+    with subject, description, task_type, and priority fields."""
+    return distributor.suggest_decomposition(description)
+
+
+@mcp.tool
+def rank_agents(team_name: str, task_id: str) -> list[dict]:
+    """Show which agents are best suited for a specific task, ranked by score.
+    Considers capability match, current load, speed, and cost efficiency.
+    Does NOT assign — use distribute() or task_update() for that."""
+    try:
+        config = teams.read_config(team_name)
+    except FileNotFoundError:
+        raise ToolError(f"Team {team_name!r} not found")
+    try:
+        task = tasks.get_task(team_name, task_id)
+    except FileNotFoundError:
+        raise ToolError(f"Task {task_id!r} not found")
+
+    teammates = [m for m in config.members if isinstance(m, TeammateMember)]
+    active_counts = distributor.get_active_task_counts(team_name)
+    rankings = distributor.rank_agents_for_task(task, teammates, active_counts)
+
+    return [
+        {
+            "agent_name": member.name,
+            "model": member.model,
+            "score": round(score, 1),
+            "active_tasks": active_counts.get(member.name, 0),
+            "profile": distributor.get_agent_profile(member),
+        }
+        for member, score in rankings
+    ]
+
+
+@mcp.tool
+def create_and_distribute(
+    team_name: str,
+    subject: str,
+    description: str,
+    task_type: str = "general",
+    priority: str = "medium",
+    blocked_by: list[str] | None = None,
+) -> dict:
+    """Create a task with type/priority metadata AND immediately try to assign it
+    to the best available agent. Combines task_create + distribute in one call.
+    task_type: architecture, implementation, refactor, testing, code_review,
+    research, documentation, bug_fix, planning, general.
+    priority: critical, high, medium, low."""
+    try:
+        task = tasks.create_task(
+            team_name,
+            subject,
+            description,
+            metadata={"task_type": task_type, "priority": priority},
+        )
+    except ValueError as e:
+        raise ToolError(str(e))
+
+    # Add dependencies if specified
+    if blocked_by:
+        try:
+            tasks.update_task(team_name, task.id, add_blocked_by=blocked_by)
+        except ValueError as e:
+            raise ToolError(str(e))
+
+    # Try to distribute
+    assignments = distributor.distribute_tasks(team_name)
+    assigned_to = None
+    for a in assignments:
+        if a["task_id"] == task.id:
+            assigned_to = a["agent_name"]
+            break
+
+    return {
+        "task_id": task.id,
+        "subject": subject,
+        "task_type": task_type,
+        "priority": priority,
+        "assigned_to": assigned_to or "queued (no capable agent available)",
+    }
 
 
 def main():
